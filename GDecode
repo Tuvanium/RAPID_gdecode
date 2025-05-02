@@ -1,0 +1,447 @@
+MODULE GDecode
+! -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --   
+!The purpose of this MODULE is to read G-code and 3D print models with a ABB robot
+!During developement, PrusaSlicer with MARLIN-flavour was used. 
+!The module uses special "Extrude" functions as wrapper for CAP move instructions. Trigg movement could also be used. 
+!This "Extrude" function must be developed for the specific "extruder" setup.
+!Functions used are: ExtrudeLStart ExtrudeL ExtrudeC  ExtrudeLStopp
+!
+!G10/G11 firmware E-retraction is used to detect where to build
+!Only relative E movement supported (M83)
+!G0 is not supported, use G1 instead.
+!
+!G1 movements shorter than "minMovement" are ignored, and skipped completely.
+!G2 and G3 movements to short are converted to G1
+!Bulding large rotation symmetrical objects? Consider to activate rotateTable for stable build position.  
+!This uses an external axis to rotate while the robot is only moving minimaly.
+!
+!Released under MIT "free" licence. But you are free to share money with me.
+!Questions?: Ingemar@Tuvanium.se (+46)73-8139629
+! -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --  
+!*******************************************************************************************************************************************************************
+!* Copyright 2025 Ingemar Eriksson, Tuvanium AB                                                                                                                    *
+!* Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"),              *
+!* to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,              *
+!* and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:                      *
+!* The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.                                  *
+!* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,             *
+!* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,   *
+!* WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.      *
+!*******************************************************************************************************************************************************************
+
+!Settings x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x 
+   
+    PERS num minMovement := 0.75;                                       !G1 lines shorter then this are skipped                 
+    PERS bool rotateTable :=TRUE;                                       !Should the external axis rotate?
+    PERS zonedata ZoneG :=[FALSE,0.3,0.3,0.3,0.03,0.3,0.03];            !Zone data used in move instructions
+    PERS wiredatatype WireG := [0,0,0,0];                               !Wire settings
+   
+!Variabel declaration----------------------------------------------------------------------
+   PERS num FileLineNum :=1;                                         !Current line in file
+   PERS bool extrudingStarted :=TRUE;                 
+   PERS robtarget GTarget :=[[0,0,0],[0,1,0,0],[-1,0,-2,0],[9E+9,0,0,9E+9,9E+9,9E+9]];
+   PERS robtarget Old_GTarget :=[[0,0,0],[0,1,0,0],[-1,0,-2,0],[9E+9,0,0,9E+9,9E+9,9E+9]];
+   PERS orient GNotRot :=[0,-1,0,0];    !GTarget rotation before rotating table.
+   PERS speeddata SpeedF := [50,500,5000,1000];
+   PERS num FeedrateE :=10; 
+   PERS bool skipedDistance :=FALSE;
+   PERS num  TableRotation :=306.776;
+   PERS bool bNotEOF :=TRUE; !Keep this as global, to enable stop reading file from outside PROCs
+   PERS tooldata ToolG :=[TRUE,[[0,0,0],[1,0,0,0]],[0,[0,0,0],[1,0,0,0],0,0,0]]; 
+   PERS wobjdata WObjG:=[FALSE,FALSE,"STN1",[[0,0,112],[1,0,0,0]],[[0,0,0],[1,0,0,0]]]; 
+
+  
+ !¤¤¤¤¤¤¤  MAIN PROC that reads the file ¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤ 
+PROC ReadGcodeFile(string FileName, num StopLine \num StartLine, tooldata tool,wobjdata WObj)        
+        VAR string LineInFile;
+        VAR iodev gfile;
+ !--------------------------------------------------------------------------Setup before start       
+        ZoneG :=z0;                                                                             !Zone parameter setup
+
+        extrudingStarted:=FALSE;                                                                !always coldstart  
+        bNotEOF:=TRUE;
+        ToolG:=tool;                                                                            !Set Tool
+        WObjG:=WObj;                                                                            !Set Work Object
+        Waitrob \Inpos;
+        GTarget:=CRobT(\Tool:=ToolG\WObj:=WObjG);                                               !Start at current pos
+        OLD_GTarget:=GTarget;
+        GNotRot := GTarget.rot;                                                                 !Tool rotation before rotating externa C-axis
+        TableRotation:=GTarget.extax.eax_c;
+!------------------------------------------------------------------------------        
+        Open "HOME:"\File:=FileName,gfile\Read;                                                 !Open file reference.
+
+        FileLineNum:=1;
+        IF Present(startLine) FileLineNum :=startLine;                                          !Possibility not to start at start.
+        
+        WHILE bNotEOF AND FileLineNum < StopLine  DO                                            !Run until (End Off File) or Stop Line reached    
+            LineInFile := ReadStr(gfile \Line:= FileLineNum);                                   !Read single line from file    
+            IF  LineInFile = "EOF" THEN
+                bNotEOF:=FALSE;
+            ELSE
+                RemoveComment(LineInFile);                                                      !Send text line to RemoveComment() for processing and decoding. 
+            ENDIF    
+            FileLineNum:=FileLineNum+1;                                                         !Next line 
+            waittime 0.05;                                                                      !Wait to free time to CPU
+         ENDWHILE
+        
+         Close gfile;                                                                           !Close file reference when done.   
+        
+ENDPROC
+ 
+!xxx Step 1 in decoding xxxxxxxx Remove comments and empty lines xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  
+LOCAL PROC RemoveComment(string TextLine)                                                       !Find and remove comments ";". Send code before ";" to Decode() 
+   VAR num linelength;    
+   VAR num commentpos;
+   VAR string comment;
+   VAR string GcodeLine;
+   
+   linelength := StrLen(TextLine);
+   commentpos:= StrFind(TextLine,1,";");                                                        !Find ";"
+   
+   IF commentpos < linelength THEN                                                              !If ";" found, separate into two strings                             
+      comment:= StrPart(TextLine,commentpos,(linelength-commentpos+1));
+      GcodeLine:= StrPart(TextLine,1,commentpos-1);
+      ErrWrite \I,"#" + StrPart(comment,1,min((linelength-commentpos+1),30)),"Comment in G-code "\RL2:=comment \RL3:="FileLineNum:"+NumToStr(FileLineNum,0);
+    ELSE
+      GcodeLine:= TextLine;                                                                     !ELSE : No ";"-comment on this line in the file
+   ENDIF
+   
+   IF NOT GcodeLine =""  THEN                                                                   !"Valid" G-code without comment. Not empty string.
+     !ErrWrite \I,"G-code : " + GcodeLine,"G-code to be decoded Line:" + NumToStr(FileLineNum,0);       !Debugg errwrite 
+     Decode(GcodeLine);                                                                         !Send G-code to step 2.  Decode()        
+   ENDIF
+   
+ENDPROC 
+
+!XXX Step 2 in Decoding XXXXXXXXXXXXXX Find G-code type M83, G92, M107, G1 ...ect.XXXXXXXXXXXXXX
+LOCAL PROC Decode(string GcodeLine)
+        VAR num linelength;
+        VAR num spacePos;       
+        VAR string gCode;
+                
+        linelength :=strLen(GcodeLine);
+        spacePos:= StrFind(GcodeLine,1," ");                                                    !Find " "- blank space in line. G-code is before this
+        Gcode:= StrPart(GcodeLine,1,spacePos-1);
+          
+        TEST Gcode        
+            CASE "G21":! ; set units to millimeters                                             !Many commands from Slicer software is not used in this decoder
+            CASE "M83":!E axis in relative mode
+            CASE "G90":! ; use absolute coordinates         
+            CASE "G92":! - Set Position   (of E axis. typical E0)
+            CASE "M107":!Turn off fan
+            CASE "G10":! ; retract
+                      IF extrudingStarted THEN                      
+                          ExtrudeLStop Old_GTarget,fine,SpeedF,WireG;                           !Stop extruding if "extrudingStarted" still TRUE before G10-code.
+                          WaitRob \ZeroSpeed;
+                          ResetExternal;
+                          extrudingStarted:=FALSE;
+                      ENDIF        
+            CASE "G11":! unretract    
+            CASE "G0":!Linear transport movement
+                ErrWrite "G0 is not supported","G0 is not supported, decoder is using G1 instead" \RL2:="FileLineNum: "+ValToStr(FileLineNum);
+                G1 StrPart(GcodeLine,spacePos+1,linelength-spacePos);         
+            CASE "G1":!Linear "active" movement                                                
+                G1 StrPart(GcodeLine,spacePos+1,linelength-spacePos);                           !Go to step 3 in decoding. Include the "parameters" for this line
+            CASE "G2":!Arc movement -Clockwise
+                G2G3 StrPart(GcodeLine,spacePos+1,linelength-spacePos),TRUE;                    !Clockwise
+            CASE "G3":!Arc movement counter clockwise
+                G2G3 StrPart(GcodeLine,spacePos+1,linelength-spacePos),FALSE;                   !Counter-clockwise            
+            DEFAULT:        
+                Errwrite \W, "Unknown G-code","Cannot be decoded "+Gcode \RL2:="FileLineNum: "+ValToStr(FileLineNum);
+        ENDTEST
+    ENDPROC
+ 
+!ZZZZZZZZ Step 3 in decoding  ZZZZZZZZZZZZZ  G1 to movement ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
+LOCAL PROC G1(string parameters)
+        VAR string nextPart;
+        VAR string g1_part;
+        VAR bool G1PartsRemain;
+        VAR string partType;
+        VAR string partValue;
+        VAR num partLength;
+        VAR bool bOK;
+        VAR num PartNum;
+        VAR num linelength;
+        VAR num spacePos;    
+        
+        VAR bool bMove;      
+        VAR bool extrude;        
+        
+        VAR num movement_mm;
+        VAR pos movement_pos;
+        VAR robtarget robPrestart;
+
+        
+        extrude := FALSE;                                                                       !Extrud only if E is defined in the "parameters" string
+        nextPart:=parameters;    
+        G1PartsRemain :=TRUE ;
+        bMove :=FALSE;                                                                          !Check if X,Y or Z is a parameter. Only then move...  
+ !Decode text after G1       
+        WHILE G1PartsRemain DO                                                                  !Extract all parts of the G1 command via WHILE loop
+            linelength :=strLen(nextPart);
+            spacePos:= StrFind(nextPart,1," ");                                                 !Parts are separated by " "-blank space.
+            g1_part:=StrPart(nextPart,1,spacePos-1);                                            !Get first part of G1 line (Xx.x Yx.x Zx.x Fxxx Ex.x)
+
+            IF spacePos>=linelength THEN                                                        !If no more " " is found.  
+                G1PartsRemain := FALSE; 
+            ELSE
+                nextPart:= StrPart(nextPart,spacePos+1,linelength-spacePos);
+            ENDIF      
+            
+            partLength:=strLen(g1_part);
+            partType:=StrPart(g1_part,1,1);                                                     !Get type ('X', 'Y', 'Z', 'F', 'E') 
+            partValue:=StrPart(g1_part,2,partLength-1);
+            bOK:=StrToVal(partValue,PartNum);                                                   !Get value of parameter
+            IF NOT(bOK) Errwrite "ERROR G1 decode", "Unable to get value in:" \RL2:=parameters\RL3:="FileLineNum: "+ValToStr(FileLineNum); !Show error if unable to get value 
+            
+            TEST partType
+                CASE "F":
+                  SpeedF.v_tcp:=PartNum/60;                                                     !"F" is mm/min ---- .V_tcp is  mm/s 
+                CASE "X":
+                  GTarget.trans.x:=PartNum;                                                     !If X,Y or Z -> this is a movement. Indicated by bMove:=TRUE
+                  bMove:=TRUE;
+                CASE "Y":
+                  GTarget.trans.y:=PartNum;
+                  bMove:=TRUE;
+                CASE "Z":
+                  GTarget.trans.z:=PartNum;
+                  bMove:=TRUE;
+                CASE "E":
+                    extrude := TRUE; 
+                    movement_mm:=Distance(GTarget.trans, old_GTarget.trans); 
+                    IF (NOT(skipedDistance) )AND movement_mm>1 THEN                             !If distance is skipped, dont do the wire feed calculation  
+                       FeedrateE := (((PartNum/movement_mm)*SpeedF.v_tcp)/1000)*60;             ! (PartNum/movement is dimensionless) (SpeedF.v_tcp is mm/s) (wirefeed is m/min)
+                       WireG.Speed :=FeedrateE;
+                    ENDIF
+                DEFAULT:    
+                    ErrWrite "G1 part code not defined", "Unknown command:" \RL2:=partType+partValue \RL3:="FileLineNum: "+ValToStr(FileLineNum);
+             ENDTEST
+
+        ENDWHILE    
+!decoding G1 continues... X Y Z are already saved in GTarget. Actual movement decoded next. If an Exx.x parameter was found in the line, then "extrude" via AMDw movements. 
+        IF bMove=TRUE THEN                                                                      !IF we have new X,Y or Z coordinates to move to.    
+                                                      
+            GTarget := RotExtC(GTarget,Old_GTarget);                                            !Rotates external axis (if  rotateTable = TRUE); 
+            movement_mm:=Distance(GTarget.trans, old_GTarget.trans);                            
+            skipedDistance:=FALSE;                                                              !Reset the skipedDistance that indicates the last segment was to short.
+            
+            IF extrude THEN                                                                     !"E" was included in parameters string                       
+                  IF movement_mm > minMovement THEN                                             !movement over minMovement... lets extrude
+                        IF NOT(extrudingStarted) THEN   
+                            !Start extruding. Create a fake pos before start pos (Old_Gtarget). Start extrude at old pos and move to new point with AMDwL
+                            movement_pos := GTarget.trans-Old_GTarget.trans;
+                            movement_mm:=Distance(GTarget.trans, old_GTarget.trans);
+                            movement_pos:=movement_pos/movement_mm;                             !Create normalised movement 1mm
+                            robPrestart:=OLD_GTarget;
+                            robPrestart.trans:=OLD_GTarget.trans-movement_pos*2;                !~2mm before start
+                            MoveL robPrestart,SpeedF,Fine,ToolG\WObj:=WObjG;
+                            WaitRob \Zerospeed;                                                 !Fine point,\Zerospeed before Start instruction.
+                            ExtrudeLStart OLD_GTarget,ZoneG,SpeedF,WireG,ToolG,WObjG;           !Start extruding     
+                            extrudingStarted:=TRUE;                                             
+                        ENDIF
+                        ExtrudeL GTarget,ZoneG,SpeedF,WireG;                                    !Extrude to the "new" position
+                  ELSE
+                        skipedDistance:=TRUE;                                                   !To short movement, skip this line in the file.  "movement_mm < minMovement"             
+                        Errwrite \W,"Skipped distance when extruding","A short distance was skipped" 
+                                \RL2:="FileLineNum: "+ValToStr(FileLineNum)\RL3:="G1 " +parameters \RL4:="From:"+ValToStr(old_GTarget.trans) + " To:" + ValToStr(GTarget.trans);
+                  ENDIF
+             ELSE                                                                               !Not extruding (no Ex.x parameter), normal MoveL (or stop extruding)
+                  IF extrudingStarted THEN
+                      ExtrudeLStop Old_GTarget,fine,SpeedF,WireG;                               !Stop extruding at old position
+                      WaitRob \ZeroSpeed;
+                      ResetExternal;                                                            !Reset external axis-C to +-180 degrees (software reset of axis position)
+                      extrudingStarted:=FALSE;
+                  ENDIF
+!                  errwrite \w ,"MoveL","MoveL " +ValToStr(GTarget.trans);
+                  IF movement_mm > minMovement THEN
+                     MoveL GTarget,SpeedF,ZoneG,ToolG\WObj:=WObjG;                              !MoveL transport movement.
+                  ELSE
+                      skipedDistance:=TRUE;
+                      Errwrite \W,"Skipped distance during transport","A short distance was skipped" 
+                                \RL2:="FileLineNum: "+ValToStr(FileLineNum)\RL3:="G1 " +parameters \RL4:="From:"+ValToStr(old_GTarget.trans) + " To:" + ValToStr(GTarget.trans);
+                  ENDIF                  
+             ENDIF               
+             IF NOT(skipedDistance) THEN
+                Old_GTarget:=GTarget;                                                           !Save old position. AMDw instructions are send with delay.
+             ENDIF   
+        ENDIF       
+ENDPROC
+    
+!ZZZZZZZZ Step 3 in decoding  ZZZZZZZZZZZZZ  G2 and G3 arc movement. (MoveC) ZZZZZZZZZZZZZZZZZZZ
+LOCAL PROC G2G3(string parameters,bool clockwise) 
+        VAR string nextPart;
+        VAR string g2_part;
+        VAR bool G2PartsRemain;
+        VAR string partType;
+        VAR string partValue;
+        VAR num partLength;
+        VAR bool bOK;
+        VAR num PartNum;
+        VAR num linelength;
+        VAR num spacePos;    
+        
+        VAR bool bMove;       
+        VAR num movement_mm;   
+        VAR bool extrude;
+        
+        VAR robtarget ArcViaPoint;
+        VAR num ArcI;
+        VAR num ArcJ;
+        VAR num radius;
+        VAR num StartAngle;
+        VAR num midAngle;
+        VAR num StopAngle;
+        VAR num moveAngle;
+        VAR num offsX;
+        VAR num OffsY;
+        
+        extrude := FALSE;                                                                       !Extrud only if E is defined in the "parameters" string
+        nextPart:=parameters;    
+        G2PartsRemain :=TRUE ;
+        bMove :=FALSE;                                                                          !Check if X,Y or Z is a parameter. Only then move...  
+ !Decode text after G2/G3       
+        WHILE G2PartsRemain DO                                                                  !Extract all parts of the G2/G3 command via WHILE
+            linelength :=strLen(nextPart);
+            spacePos:= StrFind(nextPart,1," "); 
+            g2_part:=StrPart(nextPart,1,spacePos-1);                                            !Get first part of G2 line (Xx.x Yx.x Zx.x Fxxx Ex.x
+
+            IF spacePos>=linelength THEN                                                        !If no more " " is found.  
+                G2PartsRemain := FALSE; 
+            ELSE
+                nextPart:= StrPart(nextPart,spacePos+1,linelength-spacePos);
+            ENDIF      
+            
+            partLength:=strLen(g2_part);
+            partType:=StrPart(g2_part,1,1);                                                     !Get type ('X', 'Y', 'Z', 'F', 'E') 
+            partValue:=StrPart(g2_part,2,partLength-1);
+            bOK:=StrToVal(partValue,PartNum);                                                   !Get value of parameter
+            IF NOT(bOK) Errwrite "ERROR G1 decode", "Unable to get value in:" \RL2:=parameters \RL3:="FileLineNum: "+ValToStr(FileLineNum); !Show error if unable to get value 
+            
+            TEST partType
+                CASE "F":
+                  SpeedF.v_tcp:=PartNum/60;                                                     !"F" is mm/min ---- .V_tcp is  mm/s 
+                CASE "X":
+                  GTarget.trans.x:=PartNum;
+                  bMove:=TRUE;
+                CASE "Y":
+                  GTarget.trans.y:=PartNum;
+                  bMove:=TRUE;
+                CASE "I":
+                  ArcI := PartNum;                                                              !I,J is relative circle center point coordinates.
+                CASE "J":
+                  ArcJ := PartNum;
+                CASE "Z":
+                  ErrWrite "Z in G2","Z movement in G2 is not implemented" \RL2:="FileLineNum: "+ValToStr(FileLineNum);  
+                CASE "E":
+                    extrude := TRUE; 
+                    FeedrateE := PartNum;                                                       !Extruder feed value is calculated later when arc length is calculated              
+                DEFAULT:    
+                    ErrWrite "G2 part code not defined", "Unknown command:" \RL2:=partType+partValue \RL3:="FileLineNum: "+ValToStr(FileLineNum);
+             ENDTEST 
+
+        ENDWHILE    
+!decoding G2 continues... X Y Z are already saved in GTarget. Actual movement decoded, if a Exx.x was found in the line "extrude" via AMDw movements. 
+        IF bMove=TRUE THEN   
+          
+              movement_mm:=Distance(GTarget.trans, old_GTarget.trans);                          !Get linear distance start-stop. Used to determine if it is to short           
+
+              IF movement_mm > 5 THEN                                                           !If start-stop positions are close use G1 instead! Distance should be "much" larger than "minMovement"                                     
+                  radius :=Sqrt(ArcI*ArcI +ArcJ*ArcJ);
+                  StartAngle := ATan2(ArcJ,ArcI);                     
+                  StopAngle := ATan2((old_GTarget.trans.Y-GTarget.trans.Y+ArcJ),(old_GTarget.trans.X-GTarget.trans.X+ArcI));
+                 
+                  IF clockwise THEN
+                      IF StopAngle > StartAngle StopAngle:=StopAngle-360;                       !Fix for G2... always clockwise
+                      midAngle := (StartAngle-StopAngle)/2+StopAngle;
+                  ELSE
+                      IF StopAngle < StartAngle StopAngle:=StopAngle+360;                       !Fix for G3... always counter-clockwise
+                      midAngle := (StopAngle-StartAngle)/2+StartAngle;
+                 ENDIF
+                 
+                  offsX:=ArcI-cos(midAngle)*radius;
+                  offsY:=ArcJ-sin(midAngle)*radius;
+                  ArcViaPoint := Offs(Old_GTarget,offsX,offsY,0);                               !Find ArcViaPoint by offset start point
+                  ArcViaPoint := RotExtC(ArcViaPoint,Old_GTarget);                              !Rotate External table
+                  GTarget := RotExtC(GTarget,ArcViaPoint);
+                   
+                  IF extrude THEN
+                    moveAngle :=abs(((StartAngle-StopAngle)/180)*pi);                           !moveangle in radians
+                    movement_mm := moveAngle*radius;                                            !Arc length in mm 
+                    FeedrateE := (((FeedrateE/movement_mm)*SpeedF.v_tcp)/1000)*60;              !Calculate FeedrateE
+                    WireG.Speed :=FeedrateE;
+                    IF NOT(extrudingStarted) THEN                                               !Setup start position    
+                         offsX := -offsX/movement_mm*2*5; 
+                         offsY := -offsY/movement_mm*2*5;                                       !Not always a good place to start! QnD version 
+                         MoveL Offs(OLD_GTarget,offsX,OffsY,0),SpeedF,Fine,ToolG\WObj:=WObjG;   !Prestart position
+                         ExtrudeLStart OLD_GTarget,ZoneG,SpeedF,WireG,ToolG,WObjG;              !Start extrution on previus point       
+                         extrudingStarted:=TRUE;
+                     ENDIF
+                    ExtrudeC ArcViaPoint, GTarget,ZoneG,SpeedF,WireG;                           !Make arc movement and extrude
+                ELSE    
+                    IF extrudingStarted THEN
+                      ExtrudeLStop Old_GTarget,fine,SpeedF,WireG;                               !Stop extrude in old_pos if "Exx.x" not in this line
+                      WaitRob \ZeroSpeed;
+                      ResetExternal;                                                            !Reset external axis to +-180
+                      extrudingStarted:=FALSE;
+                   ENDIF
+                    
+                    MoveC ArcViaPoint, GTarget,SpeedF,ZoneG,ToolG\WObj:=WObjG;                  !Move C. Arc transport movement
+                ENDIF                                                         
+                                                                       
+                                   
+              ELSE
+                 Errwrite \W,"G2/G3 to short. Replace with G1","Arc must be longer" 
+                            \RL2:="FileLineNum: "+ValToStr(FileLineNum)\RL3:="G2/G3 " +parameters;
+                 G1(parameters);                                                                !If start-stop positions are close use G1 instead!  
+              ENDIF                  
+         ENDIF               
+        
+         Old_GTarget:=GTarget;                                                                  !Save "New" position as "Old" position. AMDwStop instructions send with delay.               
+ENDPROC    
+    
+FUNC robtarget RotExtC(robtarget newpos,robtarget oldpos)
+        VAR num deltaRot;
+        VAR num newRot;
+        VAR num oldRot;
+        VAR num toolRot;
+        !If rotateTable setting is active. Rotate the external axis to have the robot stationary.
+
+        IF rotateTable THEN    
+                    oldRot :=-ATan2(oldpos.trans.y, oldpos.trans.x);
+                    newRot :=-ATan2(newpos.trans.y, newpos.trans.x);     
+                    deltaRot:=oldRot-newRot;                                                    !Change in rotation during movement. 
+                     IF deltaRot>180 deltaRot:=deltaRot-360;                                    !Set deltaRot to +-180;    
+                     IF deltaRot<-180 deltaRot:=deltaRot+360;
+                        
+                    TableRotation:=TableRotation-deltaRot;                                      !Cummulative rotation. Can get big!     
+                    newpos.extax.eax_C :=TableRotation;                                         !Set rotation to external axis                    
+                    toolRot:=TableRotation;                 
+                    
+                    WHILE toolRot>180 DO                                                        !Make tool orientation +-180
+                        toolRot:=toolRot-360;
+                    ENDWHILE
+                    WHILE toolRot<-180 DO
+                        toolRot:=toolRot+360;
+                    ENDWHILE
+                    newpos.rot:=GNotRot;                                                         !Restore unrotated tool                                                               
+                    newpos := RelTool(newpos,0,0,0\Rz:=toolRot);                                 !Rotate tool in Z-axis    
+        ENDIF
+                    
+        RETURN newpos;                                                                          !RETURN robot target vale for FUNCtion       
+ENDFUNC
+ 
+LOCAL PROC ResetExternal()    
+        IF rotateTable THEN                                                                      !Only reset if rotateTable=TRUE                                                                                               
+                WHILE TableRotation>180 DO                                                       !Set TableRotation to +-180         
+                        TableRotation:=TableRotation-360;
+                ENDWHILE
+                WHILE TableRotation<-180 DO
+                        TableRotation:=TableRotation+360;
+                ENDWHILE
+                GTarget.extax.eax_c:=TableRotation;
+                WaitRob\ZeroSpeed;                                                               !Wait untill robot has \ZeroSpeed before reset
+                IndReset STN1,2\RefNum:=TableRotation\Short;                                     !Move axis C to current position (software reset to +-180)
+                WaitRob\ZeroSpeed;
+        ENDIF        
+ENDPROC
+ENDMODULE
